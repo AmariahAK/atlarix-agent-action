@@ -1,6 +1,11 @@
 # Atlarix cloud agent — GitHub Action
 
-Runs work you ask Atlarix for (from Slack or [atlarix.dev/cloud](https://atlarix.dev/cloud)) **in your own repository's GitHub Actions**, then opens a pull request. Nothing is merged until the person who asked approves it.
+The [Atlarix cloud agent](https://atlarix.dev/cloud-agent) is an AI coding agent that works on your
+repository while your computer is off. This action is the part that runs in GitHub Actions: it runs
+the [Atlarix CLI](https://atlarix.dev/cli) on the task, on paid Atlarix models or free on your own
+API key.
+
+It runs work you ask Atlarix for (from Slack or [atlarix.dev/cloud](https://atlarix.dev/cloud)) **in your own repository's GitHub Actions**, then opens a pull request. Nothing is merged until the person who asked approves it.
 
 You don't add this by hand. The setup page on atlarix.dev opens a pull request that adds `.github/workflows/atlarix.yml`:
 
