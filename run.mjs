@@ -15,7 +15,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { byokProblem, childEnv, cliArgs } from "./lib.mjs";
+import { byokProblem, childEnv, cliArgs, ownKeyReport } from "./lib.mjs";
 
 const JOB_ID = process.env.ATLARIX_JOB_ID ?? "";
 const API = (process.env.ATLARIX_API_URL ?? "").replace(/\/+$/, "");
@@ -84,9 +84,12 @@ function git(args, opts = {}) {
   return (r.stdout || "").trim();
 }
 
+/** Added to the final report once the claim says whose model this run uses. */
+let runIdentity = {};
+
 async function report(body) {
   try {
-    await api("/cloud/complete", { job_id: JOB_ID, ...body });
+    await api("/cloud/complete", { job_id: JOB_ID, ...runIdentity, ...body });
   } catch (e) {
     fail(`Could not report the result to Atlarix: ${e.message}`);
   }
@@ -107,6 +110,7 @@ async function main() {
     const problem = byokProblem(byok);
     if (problem) throw new Error(problem);
   }
+  runIdentity = ownKeyReport(byok);
 
   const tmp = mkdtempSync(join(tmpdir(), "atlarix-"));
   const promptFile = join(tmp, "task.md");

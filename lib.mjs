@@ -61,3 +61,13 @@ export function childEnv(parent, extra = {}) {
   env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = "";
   return { ...env, ...extra };
 }
+
+/**
+ * What an own-key run tells Atlarix about itself when it finishes: which
+ * provider and model it used, so the user's usage shows as their own key and
+ * not as a lapsed customer. Never the key. Nothing for a paid run, whose model
+ * Atlarix already knows (it is the job's tier).
+ */
+export function ownKeyReport(byok) {
+  return byok ? { provider: byok.provider, model: byok.model } : {};
+}

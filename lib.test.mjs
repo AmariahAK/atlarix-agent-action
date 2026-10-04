@@ -1,7 +1,7 @@
 // node --test   (no dependencies)
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { byokProblem, childEnv, cliArgs } from "./lib.mjs";
+import { byokProblem, childEnv, cliArgs, ownKeyReport } from "./lib.mjs";
 
 const base = {
   claim: { tier: "core-auto" },
@@ -61,4 +61,11 @@ test("an own-key run with something missing says exactly what to add", () => {
   assert.match(msg, /ATLARIX_MODEL/);
   assert.doesNotMatch(msg, /variable ATLARIX_PROVIDER \(/);
   assert.match(byokProblem({ key: "k", provider: "not a provider!", model: "m" }), /isn't a provider id/);
+});
+
+test("an own-key run reports its provider and model, never the key; a paid run reports neither", () => {
+  const r = ownKeyReport({ key: "sk-secret", provider: "deepseek", model: "deepseek-chat" });
+  assert.deepEqual(r, { provider: "deepseek", model: "deepseek-chat" });
+  assert.ok(!JSON.stringify(r).includes("sk-secret"));
+  assert.deepEqual(ownKeyReport(null), {});
 });
