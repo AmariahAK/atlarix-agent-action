@@ -3,7 +3,7 @@ description: AI coding agent in your GitHub Actions. Ask from Slack or atlarix.d
 author: Atlarix
 branding:
   icon: git-pull-request
-  color: purple
+  color: green
 
 inputs:
   job-id:
