@@ -19,8 +19,8 @@ inputs:
     default: latest
   provider-key:
     description: >-
-      Your own provider API key, for runs on your own key (pass a secret:
-      `${{ secrets.ATLARIX_PROVIDER_KEY }}`). Ignored for runs on Atlarix models.
+      Your own provider API key, for runs on your own key (pass the repository
+      secret ATLARIX_PROVIDER_KEY). Ignored for runs on Atlarix models.
       Handed to Atlarix in a file it deletes, never in the environment the
       agent's commands can read.
     required: false
