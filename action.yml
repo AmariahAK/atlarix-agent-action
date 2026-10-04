@@ -1,5 +1,5 @@
 name: Atlarix cloud agent
-description: The Atlarix AI coding agent in your GitHub Actions. Runs a task you asked for from Slack or atlarix.dev and opens a pull request.
+description: AI coding agent in your GitHub Actions. Ask from Slack or atlarix.dev and get a pull request back.
 author: Atlarix
 branding:
   icon: git-pull-request
