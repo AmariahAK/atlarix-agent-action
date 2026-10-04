@@ -7,7 +7,14 @@ API key.
 
 It runs work you ask Atlarix for (from Slack or [atlarix.dev/cloud](https://atlarix.dev/cloud)) **in your own repository's GitHub Actions**, then opens a pull request. Nothing is merged until the person who asked approves it.
 
-You don't add this by hand. The setup page on atlarix.dev opens a pull request that adds `.github/workflows/atlarix.yml`:
+## Get started
+
+1. Open **[atlarix.dev/cloud](https://atlarix.dev/cloud)** and sign in.
+2. Install the **Atlarix Cloud Agent** GitHub App on the repositories it may work on.
+3. Press **Add workflow** next to a repository. That opens a pull request adding the workflow below; merge it.
+4. Ask for work there, or DM Atlarix in Slack: `owner/repo: fix the flaky login test`.
+
+You don't add this file by hand; the setup pull request adds `.github/workflows/atlarix.yml`:
 
 ```yaml
 on:
@@ -61,3 +68,19 @@ If your tests need more than the checkout (dependencies, a database), add `.atla
 | `provider-key` | — | Your own key, for own-key runs: `${{ secrets.ATLARIX_PROVIDER_KEY }}`. Ignored on runs using Atlarix models. |
 | `provider` | — | Your key's provider id, for own-key runs. |
 | `model` | — | That provider's model id, for own-key runs. |
+
+## FAQ
+
+**What does it cost?** The compute is your own GitHub Actions minutes. The model is either an Atlarix model, billed per run to the Atlarix account that asked (Pro allowance first, then credit), or your own API key, which costs nothing on Atlarix's side.
+
+**Does it work on private repositories?** Yes. The workflow runs in your repository's own Actions, and the agent only reaches the repository the job is for.
+
+**Can it merge on its own?** No. Every change comes back as a pull request, and nothing merges until the person who asked approves it (on atlarix.dev or with the Approve button in Slack).
+
+**Which models can I use?** Atlarix Auto, a Core model, or your own key for any supported provider (Anthropic, OpenAI, DeepSeek, OpenRouter and more).
+
+**Can I run the same agent locally?** Yes: the [Atlarix CLI](https://atlarix.dev/cli) is the same agent in your terminal (`brew install amariahak/atlarix/atlarix` or `npm install -g atlarix`), and the [desktop app](https://atlarix.dev) is free.
+
+## License
+
+See [LICENSE](LICENSE). Atlarix is built by [NorahLabs](https://norahlabs.com).
