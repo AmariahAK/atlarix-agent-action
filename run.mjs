@@ -3,19 +3,34 @@
 // 1. Prove where we are running (GitHub OIDC) and claim the job: prompt, the
 //    model (paid Atlarix Auto, a paid Core tier, or "byok"), a job-scoped Core
 //    token (none for an own-key run), a branch name.
-// 2. Run the Atlarix CLI on the checkout. The credential (the Core token, or the
+// 2. Fetch the files attached to the request (Slack) into the runner's temp
+//    folder, never the checkout, and hand them to the CLI with --attach.
+// 3. Run the Atlarix CLI on the checkout. The credential (the Core token, or the
 //    user's own provider key) goes in a file the CLI reads and deletes — never
 //    into the environment, so the agent's own shell commands cannot see it.
-// 3. After the agent has EXITED, fetch a push token (scoped to this one repo),
-//    commit, push, open the pull request, and report back.
+//    While it runs, follow its trajectory file and post short progress (step
+//    names, the plan) for the Slack card, at most every few seconds.
+// 4. After the agent has EXITED: publish the pages it made (.atlarix/relics/)
+//    instead of committing them, fetch a push token (scoped to this one repo),
+//    commit, push, open the pull request, and report back — with a reason a
+//    person can act on when it failed.
 //
 // No dependencies: Node 22's fetch, and git/npx from the runner image.
 
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { byokProblem, childEnv, cliArgs, ownKeyReport } from "./lib.mjs";
+import { basename, join, relative } from "node:path";
+import {
+  byokProblem,
+  childEnv,
+  cliArgs,
+  failureReason,
+  ownKeyReport,
+  ProgressTracker,
+  relicPayload,
+  relicTitle,
+} from "./lib.mjs";
 
 const JOB_ID = process.env.ATLARIX_JOB_ID ?? "";
 const API = (process.env.ATLARIX_API_URL ?? "").replace(/\/+$/, "");
@@ -73,6 +88,148 @@ async function api(path, body) {
   return json;
 }
 
+/** A runner route that answers with bytes (an attachment). */
+async function apiBytes(path, body) {
+  const res = await fetch(`${API}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${await oidcToken()}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`${path} -> ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+/** The request's attachments, saved in the runner's temp folder; their paths. */
+async function fetchAttachments(claim, dir) {
+  const out = [];
+  for (const f of claim.attachments ?? []) {
+    try {
+      const bytes = await apiBytes("/cloud/attachments", { job_id: JOB_ID, file_id: f.id });
+      // Only a plain file name: never a path the request chose.
+      const safe = `${String(f.id).replace(/[^\w-]/g, "")}-${basename(String(f.name ?? "file")).replace(/[^\w.-]+/g, "_")}`.slice(0, 120);
+      const file = join(dir, safe);
+      writeFileSync(file, bytes);
+      out.push(file);
+    } catch (e) {
+      console.log(`::warning::Could not fetch attachment ${f.name}: ${e.message}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Run the CLI without blocking, following its trajectory: post progress at most
+ * every PROGRESS_MS while something changed, and keep the end of stderr for the
+ * failure reason. Resolves with the exit code.
+ */
+const PROGRESS_MS = 5_000;
+function runAgent(args, env, trajectoryFile) {
+  return new Promise((resolve) => {
+    const tracker = new ProgressTracker();
+    let stderrTail = "";
+    let started = false;
+    let offset = 0;
+    let partial = "";
+    let sentVersion = 0;
+    let sending = false;
+    const readNew = () => {
+      if (!existsSync(trajectoryFile)) return;
+      const size = statSync(trajectoryFile).size;
+      if (size <= offset) return;
+      const fd = openSync(trajectoryFile, "r");
+      const buf = Buffer.alloc(size - offset);
+      readSync(fd, buf, 0, buf.length, offset);
+      offset = size;
+      const lines = (partial + buf.toString("utf8")).split("\n");
+      partial = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const ev = JSON.parse(line);
+          if (ev.type === "run_start") started = true;
+          tracker.add(ev);
+        } catch {
+          /* a line cut mid-write is finished on the next read */
+        }
+      }
+    };
+    const post = async () => {
+      if (sending || tracker.version === sentVersion) return;
+      sending = true;
+      const version = tracker.version;
+      try {
+        await api("/cloud/progress", { job_id: JOB_ID, ...tracker.report() });
+        sentVersion = version;
+      } catch (e) {
+        // Progress is a courtesy; the run goes on without it.
+        console.log(`progress not posted: ${e.message}`);
+      } finally {
+        sending = false;
+      }
+    };
+    const timer = setInterval(() => {
+      readNew();
+      void post();
+    }, PROGRESS_MS);
+
+    const child = spawn("npx", args, { cwd: WORKSPACE, env, stdio: ["ignore", "inherit", "pipe"] });
+    child.stderr.on("data", (chunk) => {
+      process.stderr.write(chunk);
+      stderrTail = (stderrTail + chunk.toString("utf8")).slice(-8_000);
+    });
+    child.on("close", async (code, signal) => {
+      clearInterval(timer);
+      readNew();
+      await post();
+      resolve({ code: code ?? 1, signal, stderrTail, started, tracker });
+    });
+    child.on("error", (e) => {
+      stderrTail += `\n${e.message}`;
+    });
+  });
+}
+
+/**
+ * Pages the agent made this run: new folders under .atlarix/relics/. Published
+ * for the job's owner when Atlarix can (the Slack card links them), and taken
+ * out of the working tree either way, so they never land in the pull request.
+ */
+async function publishRelics(claim) {
+  const root = join(WORKSPACE, ".atlarix", "relics");
+  if (!existsSync(root)) return [];
+  // Untracked (or ignored) only: a relic the repository already tracks is the repository's business.
+  const untracked = git(["status", "--porcelain", "--untracked-files=all", "--ignored", "--", ".atlarix/relics"])
+    .split("\n")
+    .filter((l) => l.startsWith("?? ") || l.startsWith("!! "))
+    .map((l) => l.slice(3).split("/")[2])
+    .filter(Boolean);
+  const links = [];
+  for (const slug of [...new Set(untracked)]) {
+    const dir = join(root, slug);
+    if (!existsSync(join(dir, "index.html"))) continue;
+    if (claim.relics) {
+      try {
+        const files = [];
+        const walk = (d) => {
+          for (const name of readdirSync(d, { withFileTypes: true })) {
+            const p = join(d, name.name);
+            if (name.isDirectory()) walk(p);
+            else if (name.isFile()) files.push({ path: relative(dir, p).split("\\").join("/"), bytes: readFileSync(p) });
+          }
+        };
+        walk(dir);
+        const title = relicTitle(readFileSync(join(dir, "index.html"), "utf8"), slug);
+        const { url } = await api("/cloud/relics", { job_id: JOB_ID, title, files: relicPayload(files.slice(0, 50)) });
+        links.push({ title, url });
+      } catch (e) {
+        console.log(`::warning::Page ${slug} was not published: ${e.message}`);
+      }
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+  return links;
+}
+
 function run(cmd, args, opts = {}) {
   const r = spawnSync(cmd, args, { cwd: WORKSPACE, stdio: "inherit", ...opts });
   return r.status ?? 1;
@@ -117,6 +274,10 @@ async function main() {
   const tokenFile = join(tmp, "core-token");
   const keyFile = join(tmp, "provider-key");
   const outputFile = join(tmp, "summary.md");
+  const trajectoryFile = join(tmp, "trajectory.jsonl");
+  const attachDir = join(tmp, "attachments");
+  mkdirSync(attachDir);
+  const attached = await fetchAttachments(claim, attachDir);
   writeFileSync(promptFile, claim.prompt);
   if (byok) writeFileSync(keyFile, byok.key, { mode: 0o600 });
   else writeFileSync(tokenFile, claim.run_token, { mode: 0o600 });
@@ -134,16 +295,31 @@ async function main() {
   const startSha = git(["rev-parse", "HEAD"]);
 
   console.log(byok ? `Running Atlarix on your own key (${byok.provider} · ${byok.model}) on ${REPO}` : `Running Atlarix (${claim.tier}) on ${REPO}`);
-  const agentExit = run(
-    "npx",
-    cliArgs({ claim, cliVersion: CLI_VERSION, workspace: WORKSPACE, promptFile, outputFile, tokenFile, keyFile, byok }),
-    {
-      env: childEnv(process.env, {
-        ATLARIX_USER_DATA_DIR: join(tmp, "userdata"),
-        ...(byok ? {} : { ATLARIX_CORE_PROXY_URL: claim.core_proxy_url }),
-      }),
-    },
+  const timeoutMs = 38 * 60 * 1000;
+  const startedAt = Date.now();
+  const agent = await runAgent(
+    [
+      ...cliArgs({ claim, cliVersion: CLI_VERSION, workspace: WORKSPACE, promptFile, outputFile, tokenFile, keyFile, byok }),
+      "--trajectory-file",
+      trajectoryFile,
+      ...attached.flatMap((f) => ["--attach", f]),
+    ],
+    childEnv(process.env, {
+      ATLARIX_USER_DATA_DIR: join(tmp, "userdata"),
+      ...(byok ? {} : { ATLARIX_CORE_PROXY_URL: claim.core_proxy_url }),
+    }),
+    trajectoryFile,
   );
+  const agentExit = agent.code;
+  const why = () =>
+    failureReason({
+      exitCode: agentExit,
+      stderrTail: agent.stderrTail,
+      started: agent.started,
+      trajectoryError: agent.tracker.lastError,
+      timedOut: Date.now() - startedAt >= timeoutMs - 5_000,
+    });
+  const pages = await publishRelics(claim);
   const summary = existsSync(outputFile) ? readFileSync(outputFile, "utf8").trim() : "";
 
   const dirty = git(["status", "--porcelain"]) !== "";
@@ -152,7 +328,7 @@ async function main() {
     await report(
       agentExit === 0
         ? { status: "no_changes", summary }
-        : { status: "failed", summary, error: "The agent stopped before finishing and changed nothing." },
+        : { status: "failed", summary, error: `${why()} Nothing was changed.` },
     );
     return agentExit === 0 ? 0 : 1;
   }
@@ -187,7 +363,7 @@ async function main() {
       title,
       head: branch,
       base: BASE,
-      body: `${summary || "_The agent left no summary._"}\n\n---\n_Opened by the Atlarix cloud agent (job \`${JOB_ID}\`). Nothing is merged until the person who asked approves it._`,
+      body: `${summary || "_The agent left no summary._"}${pages.length ? `\n\n**Pages from this run**\n${pages.map((p) => `- [${p.title.replace(/[\[\]]/g, "")}](${p.url})`).join("\n")}` : ""}\n\n---\n_Opened by the Atlarix cloud agent (job \`${JOB_ID}\`). Nothing is merged until the person who asked approves it._`,
     }),
   });
   const pr = await res.json().catch(() => ({}));
@@ -198,7 +374,7 @@ async function main() {
     pr_number: pr.number,
     pr_url: pr.html_url,
     summary,
-    ...(agentExit === 0 ? {} : { error: "The agent did not finish cleanly; review the changes carefully." }),
+    ...(agentExit === 0 ? {} : { error: `The agent did not finish cleanly — ${why()} Review the changes carefully.` }),
   });
   return 0;
 }
