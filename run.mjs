@@ -364,7 +364,11 @@ async function main() {
   git(["config", "user.name", "atlarix[bot]"]);
   git(["config", "user.email", "atlarix[bot]@users.noreply.github.com"]);
   git(["checkout", "-B", branch]);
-  const title = (summary.split("\n").find((l) => l.trim()) ?? "").replace(/^#+\s*/, "").slice(0, 72) || "Changes from Atlarix";
+  // The person's own ask names the change (Atlarix sends it); a summary's first line is often just "Summary".
+  const title =
+    String(claim.commit_title ?? "").trim().slice(0, 72) ||
+    (summary.split("\n").find((l) => l.trim()) ?? "").replace(/^#+\s*/, "").slice(0, 72) ||
+    "Changes from Atlarix";
   if (dirty) {
     git(["add", "-A"]);
     git(["commit", "-m", `${title}\n\nAtlarix cloud agent, job ${JOB_ID}.`]);
