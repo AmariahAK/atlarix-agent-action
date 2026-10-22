@@ -10,6 +10,8 @@
 //    into the environment, so the agent's own shell commands cannot see it.
 //    While it runs, follow its trajectory file and post short progress (step
 //    names, the plan) for the Slack card, at most every few seconds.
+//    A follow-up turn on an open PR starts on that PR's branch; a question
+//    (ask) runs the CLI read-only.
 // 4. After the agent has EXITED: publish the pages it made (.atlarix/relics/)
 //    instead of committing them, fetch a push token (scoped to this one repo),
 //    commit, push, open the pull request, and report back — with a reason a
@@ -26,10 +28,12 @@ import {
   childEnv,
   cliArgs,
   failureReason,
+  outcome,
   ownKeyReport,
   ProgressTracker,
   relicPayload,
   relicTitle,
+  SUPPORTS,
 } from "./lib.mjs";
 
 const JOB_ID = process.env.ATLARIX_JOB_ID ?? "";
@@ -257,7 +261,7 @@ async function main() {
   if (!/^https:\/\//.test(API)) throw new Error("api-url must be https.");
 
   mask(BYOK_INPUT.key);
-  const claim = await api("/cloud/claim", { job_id: JOB_ID });
+  const claim = await api("/cloud/claim", { job_id: JOB_ID, supports: SUPPORTS });
   if (claim.run_token) mask(claim.run_token);
 
   // The job decides the model, not this workflow: a key set here is ignored on
@@ -281,6 +285,18 @@ async function main() {
   writeFileSync(promptFile, claim.prompt);
   if (byok) writeFileSync(keyFile, byok.key, { mode: 0o600 });
   else writeFileSync(tokenFile, claim.run_token, { mode: 0o600 });
+
+  // A follow-up turn on an open PR works on that PR's branch. The checkout
+  // fetched every branch (fetch-depth: 0), so no credential is needed here.
+  if (claim.continue_pr) {
+    if (!/^[\w./-]+$/.test(claim.branch) || claim.branch.includes("..")) throw new Error("The claim named an unusable branch.");
+    try {
+      git(["rev-parse", "--verify", `refs/remotes/origin/${claim.branch}`]);
+    } catch {
+      throw new Error(`The pull request's branch ${claim.branch} isn't in this checkout. It may have been deleted; start a new task instead.`);
+    }
+    git(["checkout", "-B", claim.branch, `refs/remotes/origin/${claim.branch}`]);
+  }
 
   // The repository's own preparation step, if it has one (the Codex pattern):
   // install dependencies, start a database, whatever the tests need.
@@ -324,13 +340,19 @@ async function main() {
 
   const dirty = git(["status", "--porcelain"]) !== "";
   const changed = dirty || git(["rev-parse", "HEAD"]) !== startSha;
-  if (!changed) {
+  const end = outcome({ claim, agentExit, changed });
+  if (end.kind === "answer") {
+    // A question changes nothing and pushes nothing, whatever the agent did.
+    await report(end.ok && summary ? { status: "answered", summary } : { status: "failed", summary, error: summary ? why() : `${why()} No answer was written.` });
+    return end.ok ? 0 : 1;
+  }
+  if (end.kind === "none") {
     await report(
-      agentExit === 0
+      end.ok
         ? { status: "no_changes", summary }
         : { status: "failed", summary, error: `${why()} Nothing was changed.` },
     );
-    return agentExit === 0 ? 0 : 1;
+    return end.ok ? 0 : 1;
   }
 
   // Only now, with the agent gone, does a credential that can write exist.
@@ -349,7 +371,25 @@ async function main() {
   }
   // The token rides a one-off header, never the remote URL, so it is not
   // written to .git/config and cannot appear in a URL in an error message.
-  git(["-c", `http.https://github.com/.extraheader=${auth}`, "push", "--force", "origin", `HEAD:refs/heads/${branch}`]);
+  // A new branch is ours to overwrite; a PR's branch only ever moves forward,
+  // so a push someone made meanwhile is never lost.
+  try {
+    git(["-c", `http.https://github.com/.extraheader=${auth}`, "push", ...(end.force ? ["--force"] : []), "origin", `HEAD:refs/heads/${branch}`]);
+  } catch (e) {
+    if (end.force) throw e;
+    throw new Error(`The pull request's branch ${branch} moved while this turn ran, so its changes weren't pushed. Reply again to redo them on top.`);
+  }
+
+  if (!end.openPr) {
+    await report({
+      status: "pr_opened",
+      pr_number: claim.continue_pr.number,
+      pr_url: claim.continue_pr.url,
+      summary,
+      ...(agentExit === 0 ? {} : { error: `The agent did not finish cleanly — ${why()} Review the changes carefully.` }),
+    });
+    return 0;
+  }
 
   const res = await fetch(`https://api.github.com/repos/${REPO}/pulls`, {
     method: "POST",

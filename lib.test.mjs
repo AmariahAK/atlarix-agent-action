@@ -1,7 +1,7 @@
 // node --test   (no dependencies)
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { byokProblem, childEnv, cliArgs, failureReason, ownKeyReport, parsePlan, ProgressTracker, relicPayload, relicTitle, stepText } from "./lib.mjs";
+import { byokProblem, childEnv, cliArgs, failureReason, outcome, ownKeyReport, parsePlan, ProgressTracker, relicPayload, relicTitle, stepText, SUPPORTS } from "./lib.mjs";
 
 const base = {
   claim: { tier: "core-auto" },
@@ -125,4 +125,25 @@ test("relic files: text as text, images as base64; the title from <title>", () =
   assert.equal(p[1].encoding, "base64");
   assert.equal(relicTitle("<title> Login  report </title>", "slug"), "Login report");
   assert.equal(relicTitle("<h1>no title</h1>", "slug"), "slug");
+});
+
+test("a question runs the CLI read-only; a task doesn't", () => {
+  const ask = cliArgs({ ...base, claim: { tier: "core-auto", mode: "ask" }, byok: null });
+  assert.deepEqual(ask.slice(ask.indexOf("--mode"), ask.indexOf("--mode") + 2), ["--mode", "ask"]);
+  assert.ok(!cliArgs({ ...base, claim: { tier: "core-auto", mode: "build" }, byok: null }).includes("--mode"));
+});
+
+test("a question never pushes, even when the agent changed files", () => {
+  assert.deepEqual(outcome({ claim: { mode: "ask" }, agentExit: 0, changed: true }), { kind: "answer", ok: true });
+  assert.deepEqual(outcome({ claim: { mode: "ask" }, agentExit: 1, changed: false }), { kind: "answer", ok: false });
+});
+
+test("a follow-up turn adds to its PR: no force, no new PR; a first turn force-pushes its own branch and opens one", () => {
+  assert.deepEqual(outcome({ claim: { mode: "build", continue_pr: { number: 12, url: "u" } }, agentExit: 0, changed: true }), { kind: "push", force: false, openPr: false });
+  assert.deepEqual(outcome({ claim: { mode: "build", continue_pr: null }, agentExit: 0, changed: true }), { kind: "push", force: true, openPr: true });
+  assert.deepEqual(outcome({ claim: {}, agentExit: 0, changed: false }), { kind: "none", ok: true });
+});
+
+test("the claim says what this runner can do, so Atlarix refuses a job an older one would get wrong", () => {
+  assert.deepEqual(SUPPORTS, ["continue", "ask"]);
 });

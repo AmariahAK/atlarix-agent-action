@@ -28,6 +28,8 @@ export function byokProblem({ key, provider, model }) {
  */
 export function cliArgs({ claim, cliVersion, workspace, promptFile, outputFile, tokenFile, keyFile, byok }) {
   const common = ["--workspace", workspace, "--prompt-file", promptFile, "--output-file", outputFile];
+  // A question only reads: the CLI's ask mode has no tool that edits or runs commands.
+  if (claim.mode === "ask") common.push("--mode", "ask");
   const model = byok
     ? ["--provider-id", byok.provider, "--model", byok.model, "--api-key-file", keyFile]
     : ["--provider-id", "compass", "--model", claim.tier, "--core-token-file", tokenFile];
@@ -40,6 +42,22 @@ export function cliArgs({ claim, cliVersion, workspace, promptFile, outputFile, 
     "--timeout",
     String(38 * 60 * 1000),
   ];
+}
+
+/** What this runner can do, sent with the claim: Atlarix refuses a job it can't run. */
+export const SUPPORTS = ["continue", "ask"];
+
+/**
+ * How the run ends, from what the claim asked for and what happened:
+ *   answer  a question: report the answer (or the failure); never push
+ *   none    a task that changed nothing
+ *   push    a task with changes: push the branch, then open a PR, or — on a
+ *           follow-up turn — add to the PR the thread already has
+ */
+export function outcome({ claim, agentExit, changed }) {
+  if (claim.mode === "ask") return { kind: "answer", ok: agentExit === 0 };
+  if (!changed) return { kind: "none", ok: agentExit === 0 };
+  return { kind: "push", force: !claim.continue_pr, openPr: !claim.continue_pr };
 }
 
 /** Variables never passed to the agent, whatever run this is. */

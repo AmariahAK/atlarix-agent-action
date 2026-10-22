@@ -41,11 +41,13 @@ jobs:
 2. **Runs the agent.** `npx atlarix` works on the checkout, with the Core token in a file it reads and deletes. The token is never in the environment, and the runner's OIDC credentials are removed from the agent's environment, so commands the agent runs can reach neither.
 3. **Pushes and opens the PR.** Only after the agent has exited, the action gets a push token scoped to **this repository** (`contents` + `pull_requests`), pushes `atlarix/<job>` and opens the pull request. The workflow's own `GITHUB_TOKEN` stays read-only.
 
+**A reply in the Slack thread** is the next turn of the same task. While its pull request is open, the next run starts on that PR's branch, adds its commits without force-pushing, and the PR updates. **A question** (`ask owner/repo: …`) runs the agent read-only and posts the answer; Atlarix never gives that run a push token.
+
 Compute is your Actions minutes (free and unlimited on public repositories).
 
 ## Models
 
-You pick the model when you start a run (atlarix.dev, or `[core-2]` / `[byok]` in Slack):
+You pick the model when you start a run on atlarix.dev. From Slack, a repository set up with your own key runs on it, and any other runs on Atlarix Auto:
 
 - **Atlarix Auto** (default) or **a Core model**: billed to the Atlarix account that asked, from its balance (Pro or credit).
 - **Your own API key**: free on Atlarix's side. In this repository's Settings → Secrets and variables → Actions, add:
