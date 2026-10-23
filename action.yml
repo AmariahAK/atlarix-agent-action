@@ -17,22 +17,6 @@ inputs:
     description: The `atlarix` npm package version to run.
     required: false
     default: latest
-  provider-key:
-    description: >-
-      Your own provider API key, for runs on your own key (pass the repository
-      secret ATLARIX_PROVIDER_KEY). Ignored for runs on Atlarix models.
-      Handed to Atlarix in a file it deletes, never in the environment the
-      agent's commands can read.
-    required: false
-    default: ""
-  provider:
-    description: The provider of your own key (e.g. anthropic, openai, openrouter). Own-key runs only.
-    required: false
-    default: ""
-  model:
-    description: That provider's model id. Own-key runs only.
-    required: false
-    default: ""
 
 runs:
   using: composite
@@ -48,8 +32,4 @@ runs:
         ATLARIX_JOB_ID: ${{ inputs.job-id }}
         ATLARIX_API_URL: ${{ inputs.api-url }}
         ATLARIX_CLI_VERSION: ${{ inputs.cli-version }}
-        # run.mjs removes the key from its own environment before anything starts.
-        ATLARIX_PROVIDER_KEY: ${{ inputs.provider-key }}
-        ATLARIX_PROVIDER: ${{ inputs.provider }}
-        ATLARIX_MODEL: ${{ inputs.model }}
       run: node "$GITHUB_ACTION_PATH/run.mjs"

@@ -1,13 +1,13 @@
 // Atlarix cloud agent — the runner side.
 //
 // 1. Prove where we are running (GitHub OIDC) and claim the job: prompt, the
-//    model (paid Atlarix Auto, a paid Core tier, or "byok"), a job-scoped Core
-//    token (none for an own-key run), a branch name.
+//    model (paid Atlarix Auto or a paid Core tier), a job-scoped Core token,
+//    a branch name.
 // 2. Fetch the files attached to the request (Slack) into the runner's temp
 //    folder, never the checkout, and hand them to the CLI with --attach.
-// 3. Run the Atlarix CLI on the checkout. The credential (the Core token, or the
-//    user's own provider key) goes in a file the CLI reads and deletes — never
-//    into the environment, so the agent's own shell commands cannot see it.
+// 3. Run the Atlarix CLI on the checkout. The Core token goes in a file the CLI
+//    reads and deletes — never into the environment, so the agent's own shell
+//    commands cannot see it.
 //    While it runs, follow its trajectory file and post short progress (step
 //    names, the plan) for the Slack card, at most every few seconds.
 //    A follow-up turn on an open PR starts on that PR's branch; a question
@@ -24,12 +24,10 @@ import { existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync
 import { tmpdir } from "node:os";
 import { basename, join, relative } from "node:path";
 import {
-  byokProblem,
   childEnv,
   cliArgs,
   failureReason,
   outcome,
-  ownKeyReport,
   ProgressTracker,
   relicPayload,
   relicTitle,
@@ -42,15 +40,6 @@ const CLI_VERSION = process.env.ATLARIX_CLI_VERSION || "latest";
 const REPO = process.env.GITHUB_REPOSITORY ?? "";
 const BASE = process.env.GITHUB_REF_NAME ?? "";
 const WORKSPACE = process.env.GITHUB_WORKSPACE ?? process.cwd();
-
-// The user's own key (only used when the job says "byok"). Taken out of this
-// process's environment at once, so nothing started from here can inherit it.
-const BYOK_INPUT = {
-  key: process.env.ATLARIX_PROVIDER_KEY ?? "",
-  provider: (process.env.ATLARIX_PROVIDER ?? "").trim().toLowerCase(),
-  model: (process.env.ATLARIX_MODEL ?? "").trim(),
-};
-delete process.env.ATLARIX_PROVIDER_KEY;
 
 /** Keep a secret out of the Actions log even if something echoes it. */
 function mask(secret) {
@@ -246,11 +235,10 @@ function git(args, opts = {}) {
 }
 
 /** Added to the final report once the claim says whose model this run uses. */
-let runIdentity = {};
 
 async function report(body) {
   try {
-    await api("/cloud/complete", { job_id: JOB_ID, ...runIdentity, ...body });
+    await api("/cloud/complete", { job_id: JOB_ID, ...body });
   } catch (e) {
     fail(`Could not report the result to Atlarix: ${e.message}`);
   }
@@ -260,31 +248,20 @@ async function main() {
   if (!/^[0-9a-f-]{36}$/i.test(JOB_ID)) throw new Error("Missing or malformed job id.");
   if (!/^https:\/\//.test(API)) throw new Error("api-url must be https.");
 
-  mask(BYOK_INPUT.key);
   const claim = await api("/cloud/claim", { job_id: JOB_ID, supports: SUPPORTS });
-  if (claim.run_token) mask(claim.run_token);
-
-  // The job decides the model, not this workflow: a key set here is ignored on
-  // a paid run, and an own-key run never gets a Core token.
-  const byok = claim.byok ? BYOK_INPUT : null;
-  if (byok) {
-    const problem = byokProblem(byok);
-    if (problem) throw new Error(problem);
-  }
-  runIdentity = ownKeyReport(byok);
+  if (!claim.run_token) throw new Error("Atlarix sent no run token for this job.");
+  mask(claim.run_token);
 
   const tmp = mkdtempSync(join(tmpdir(), "atlarix-"));
   const promptFile = join(tmp, "task.md");
   const tokenFile = join(tmp, "core-token");
-  const keyFile = join(tmp, "provider-key");
   const outputFile = join(tmp, "summary.md");
   const trajectoryFile = join(tmp, "trajectory.jsonl");
   const attachDir = join(tmp, "attachments");
   mkdirSync(attachDir);
   const attached = await fetchAttachments(claim, attachDir);
   writeFileSync(promptFile, claim.prompt);
-  if (byok) writeFileSync(keyFile, byok.key, { mode: 0o600 });
-  else writeFileSync(tokenFile, claim.run_token, { mode: 0o600 });
+  writeFileSync(tokenFile, claim.run_token, { mode: 0o600 });
 
   // A follow-up turn on an open PR works on that PR's branch. The checkout
   // fetched every branch (fetch-depth: 0), so no credential is needed here.
@@ -310,19 +287,19 @@ async function main() {
   // model may) still counts as a change rather than "nothing happened".
   const startSha = git(["rev-parse", "HEAD"]);
 
-  console.log(byok ? `Running Atlarix on your own key (${byok.provider} · ${byok.model}) on ${REPO}` : `Running Atlarix (${claim.tier}) on ${REPO}`);
+  console.log(`Running Atlarix (${claim.tier}) on ${REPO}`);
   const timeoutMs = 38 * 60 * 1000;
   const startedAt = Date.now();
   const agent = await runAgent(
     [
-      ...cliArgs({ claim, cliVersion: CLI_VERSION, workspace: WORKSPACE, promptFile, outputFile, tokenFile, keyFile, byok }),
+      ...cliArgs({ claim, cliVersion: CLI_VERSION, workspace: WORKSPACE, promptFile, outputFile, tokenFile }),
       "--trajectory-file",
       trajectoryFile,
       ...attached.flatMap((f) => ["--attach", f]),
     ],
     childEnv(process.env, {
       ATLARIX_USER_DATA_DIR: join(tmp, "userdata"),
-      ...(byok ? {} : { ATLARIX_CORE_PROXY_URL: claim.core_proxy_url }),
+      ATLARIX_CORE_PROXY_URL: claim.core_proxy_url,
     }),
     trajectoryFile,
   );
