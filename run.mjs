@@ -26,6 +26,9 @@ import { basename, join, relative } from "node:path";
 import {
   childEnv,
   cliArgs,
+  coAuthorEnabled,
+  commitMessage,
+  coreSessionFrom,
   failureReason,
   outcome,
   ProgressTracker,
@@ -37,6 +40,7 @@ import {
 const JOB_ID = process.env.ATLARIX_JOB_ID ?? "";
 const API = (process.env.ATLARIX_API_URL ?? "").replace(/\/+$/, "");
 const CLI_VERSION = process.env.ATLARIX_CLI_VERSION || "latest";
+const CO_AUTHOR = coAuthorEnabled(process.env.ATLARIX_CO_AUTHOR);
 const REPO = process.env.GITHUB_REPOSITORY ?? "";
 const BASE = process.env.GITHUB_REF_NAME ?? "";
 const WORKSPACE = process.env.GITHUB_WORKSPACE ?? process.cwd();
@@ -300,6 +304,8 @@ async function main() {
     childEnv(process.env, {
       ATLARIX_USER_DATA_DIR: join(tmp, "userdata"),
       ATLARIX_CORE_PROXY_URL: claim.core_proxy_url,
+      // One session id per thread, so paid Auto keeps one provider across turns.
+      ...(coreSessionFrom(claim) ? { ATLARIX_CORE_SESSION: coreSessionFrom(claim) } : {}),
     }),
     trajectoryFile,
   );
@@ -348,7 +354,7 @@ async function main() {
     "Changes from Atlarix";
   if (dirty) {
     git(["add", "-A"]);
-    git(["commit", "-m", `${title}\n\nAtlarix cloud agent, job ${JOB_ID}.`]);
+    git(["commit", "-m", commitMessage({ title, jobId: JOB_ID, coAuthor: CO_AUTHOR })]);
   }
   // The token rides a one-off header, never the remote URL, so it is not
   // written to .git/config and cannot appear in a URL in an error message.

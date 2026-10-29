@@ -30,6 +30,35 @@ export function cliArgs({ claim, cliVersion, workspace, promptFile, outputFile, 
 export const SUPPORTS = ["continue", "ask"];
 
 /**
+ * The trailer that names the Atlarix agent on commits the cloud agent makes,
+ * the same one the app, the CLI and the editors add (their "Co-author"
+ * setting). The commit's author stays the GitHub App's bot identity.
+ */
+export const CO_AUTHOR_TRAILER = "Co-authored-by: atlarix-agent <261929375+atlarix-agent@users.noreply.github.com>";
+
+/** The `co_author` input: on unless it is literally false/0/no/off. */
+export function coAuthorEnabled(value) {
+  return !/^\s*(false|0|no|off)\s*$/i.test(String(value ?? ""));
+}
+
+/** The commit message: the title, the job, and the trailer when it is on. */
+export function commitMessage({ title, jobId, coAuthor }) {
+  const body = `${title}\n\nAtlarix cloud agent, job ${jobId}.`;
+  return coAuthor ? `${body}\n\n${CO_AUTHOR_TRAILER}` : body;
+}
+
+/**
+ * The thread's session id from the claim, for the CLI's X-Atlarix-Session
+ * header: the same value on every turn of one Slack thread or web session, so
+ * paid Auto keeps one provider for the whole conversation. Opaque, 32 lowercase
+ * hex; anything else is ignored and the CLI falls back to its own id.
+ */
+export function coreSessionFrom(claim) {
+  const v = claim?.core_session;
+  return typeof v === "string" && /^[0-9a-f]{32}$/.test(v) ? v : undefined;
+}
+
+/**
  * How the run ends, from what the claim asked for and what happened:
  *   answer  a question: report the answer (or the failure); never push
  *   none    a task that changed nothing
@@ -100,6 +129,9 @@ export function stepText(toolName, args = {}) {
       return target ? `Looked at ${short(target)}` : "Looked at an image";
     case "plan":
       return null;
+    case "task":
+      // A helper (read-only sub-agent) the agent started; its description is the name it goes by.
+      return a.description ? `Started a helper: ${short(a.description, 70)}` : "Started a helper";
     default:
       return toolName ? short(toolName.replace(/_/g, " "), 40) : null;
   }
@@ -138,18 +170,37 @@ export class ProgressTracker {
       this.applyPlan(args);
       return;
     }
-    const text = stepText(ev.toolName, args);
+    let text = stepText(ev.toolName, args);
     if (!text) return;
     const status = ev.status === "running" ? "running" : ev.status === "error" ? "failed" : "done";
-    const known = ev.toolCallId ? this.byCall.get(ev.toolCallId) : undefined;
-    if (known) known.status = status;
-    else {
+    // A helper's own calls carry the helper's id, not the parent's tool call id;
+    // they are shown as the helper's work, not the agent's.
+    const nested = typeof ev.parentDelegationId === "string" && ev.parentDelegationId;
+    if (nested) text = `Helper: ${text}`;
+    if (ev.toolName === "task" && status !== "running") text = text.replace(/^Started a helper/, status === "failed" ? "Helper failed" : "Helper done");
+    // Running → done pairs by the call's id. Older CLIs write a helper's calls
+    // with no id at all; then the last running step with the same text is it.
+    const key = ev.toolCallId ?? ev.id;
+    const known = key
+      ? this.byCall.get(key)
+      : [...this.steps].reverse().find((s) => s.status === "running" && s.text === text);
+    if (known) {
+      known.status = status;
+      known.text = text;
+    } else {
       const step = { text, status };
       this.steps.push(step);
-      if (ev.toolCallId) this.byCall.set(ev.toolCallId, step);
+      if (key) this.byCall.set(key, step);
       if (this.steps.length > 40) this.steps.splice(0, this.steps.length - 40);
     }
     this.version++;
+  }
+
+  /** The helpers (sub-agents) the agent started, by description, with their state. */
+  helpers() {
+    return this.steps
+      .filter((s) => /^(Started a helper|Helper done|Helper failed)/.test(s.text))
+      .map((s) => ({ text: s.text.replace(/^(Started a helper|Helper done|Helper failed):?\s*/, "") || "helper", status: s.status }));
   }
 
   applyPlan(args) {
@@ -172,9 +223,9 @@ export class ProgressTracker {
     this.version++;
   }
 
-  /** What /cloud/progress gets: the last few steps and the plan. */
+  /** What /cloud/progress gets: the last few steps, the plan, and the helpers. */
   report() {
-    return { steps: this.steps.slice(-12), plan: this.plan.slice(0, 30) };
+    return { steps: this.steps.slice(-12), plan: this.plan.slice(0, 30), helpers: this.helpers().slice(-5) };
   }
 }
 

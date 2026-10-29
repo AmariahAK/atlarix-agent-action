@@ -117,3 +117,51 @@ test("a follow-up turn adds to its PR: no force, no new PR; a first turn force-p
 test("the claim says what this runner can do, so Atlarix refuses a job an older one would get wrong", () => {
   assert.deepEqual(SUPPORTS, ["continue", "ask"]);
 });
+
+test("a commit names the Atlarix agent as co-author when the input is on, and never agent@atlarix.dev", async () => {
+  const { commitMessage, coAuthorEnabled, CO_AUTHOR_TRAILER } = await import("./lib.mjs");
+  const on = commitMessage({ title: "Fix login", jobId: "j1", coAuthor: true });
+  assert.equal(on, `Fix login\n\nAtlarix cloud agent, job j1.\n\n${CO_AUTHOR_TRAILER}`);
+  assert.equal(CO_AUTHOR_TRAILER, "Co-authored-by: atlarix-agent <261929375+atlarix-agent@users.noreply.github.com>");
+  assert.ok(!on.includes("agent@atlarix.dev"));
+  const off = commitMessage({ title: "Fix login", jobId: "j1", coAuthor: false });
+  assert.equal(off, "Fix login\n\nAtlarix cloud agent, job j1.");
+  assert.ok(!off.includes("Co-authored-by"));
+  for (const v of [undefined, "", "true", "True", " yes "]) assert.equal(coAuthorEnabled(v), true, String(v));
+  for (const v of ["false", "FALSE", "0", "no", "off"]) assert.equal(coAuthorEnabled(v), false, v);
+});
+
+test("the thread's session id reaches the CLI only when it is the opaque 32-hex value", async () => {
+  const { coreSessionFrom } = await import("./lib.mjs");
+  const id = "0123456789abcdef0123456789abcdef";
+  assert.equal(coreSessionFrom({ core_session: id }), id);
+  assert.equal(coreSessionFrom({}), undefined);
+  assert.equal(coreSessionFrom({ core_session: "ABCDEF" }), undefined);
+  assert.equal(coreSessionFrom({ core_session: `${id}\n` }), undefined);
+  assert.equal(coreSessionFrom({ core_session: "job-123;rm -rf" }), undefined);
+});
+
+test("helpers the agent starts show as helpers, and a helper's own calls are not counted twice", () => {
+  const t = new ProgressTracker();
+  t.add({ type: "tool_use", toolCallId: "p1", toolName: "task", status: "running", args: { description: "channels", prompt: "SECRET" } });
+  t.add({ type: "tool_use", toolCallId: "p2", toolName: "task", status: "running", args: { description: "PR history", prompt: "SECRET" } });
+  // the helper's own calls: an id of their own and the delegation they belong to (15.12 CLI)
+  t.add({ type: "tool_use", id: "n1", parentDelegationId: "d1", toolName: "grep", status: "running", args: { pattern: "login" } });
+  t.add({ type: "tool_use", id: "n1", parentDelegationId: "d1", toolName: "grep", status: "done", args: { pattern: "login" } });
+  // an older CLI writes a helper's calls with no id at all
+  t.add({ type: "tool_use", toolName: "read_file", status: "running", args: { path: "a.ts" } });
+  t.add({ type: "tool_use", toolName: "read_file", status: "done", args: { path: "a.ts" } });
+  t.add({ type: "tool_use", toolCallId: "p1", toolName: "task", status: "done", args: { description: "channels", prompt: "SECRET" } });
+  const r = t.report();
+  assert.deepEqual(r.steps, [
+    { text: "Helper done: channels", status: "done" },
+    { text: "Started a helper: PR history", status: "running" },
+    { text: "Helper: Searched for login", status: "done" },
+    { text: "Read a.ts", status: "done" },
+  ]);
+  assert.deepEqual(r.helpers, [
+    { text: "channels", status: "done" },
+    { text: "PR history", status: "running" },
+  ]);
+  assert.ok(!JSON.stringify(r).includes("SECRET"));
+});
