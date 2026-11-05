@@ -18,12 +18,16 @@ You don't add this file by hand; the setup pull request adds `.github/workflows/
 ```yaml
 on:
   repository_dispatch:
-    types: [atlarix-task]
+    types: [atlarix-task, atlarix-review]
 permissions:
   id-token: write
   contents: read
+concurrency:
+  group: atlarix-${{ github.event.client_payload.group || github.event.client_payload.job_id }}
+  cancel-in-progress: ${{ github.event.action == 'atlarix-review' }}
 jobs:
   run:
+    if: github.event.action == 'atlarix-task'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -32,7 +36,19 @@ jobs:
       - uses: AmariahAK/atlarix-agent-action@v1
         with:
           job-id: ${{ github.event.client_payload.job_id }}
+  review:
+    if: github.event.action == 'atlarix-review'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.client_payload.sha }}", fetch-depth: 1, persist-credentials: false }
+      - uses: AmariahAK/atlarix-agent-action@v1
+        with:
+          job-id: ${{ github.event.client_payload.job_id }}
 ```
+
+A workflow added before reviews existed lists only `atlarix-task`; tasks work as before, and reviews keep reading through the GitHub API until you add `atlarix-review` and the `review` job.
 
 ## What it does, and what it can reach
 
@@ -43,6 +59,22 @@ jobs:
 **A reply in the Slack thread** is the next turn of the same task. While its pull request is open, the next run starts on that PR's branch, adds its commits without force-pushing, and the PR updates. **A question** (`ask owner/repo: …`) runs the agent read-only and posts the answer; Atlarix never gives that run a push token.
 
 Compute is your Actions minutes (free and unlimited on public repositories).
+
+## Pull-request reviews in your runner (opt-in)
+
+The [Atlarix Reviewer](https://atlarix.dev) normally reads a pull request through the GitHub API. You can have it read the code from a checkout in your own runner instead: search is then complete and at the pull request's own commit, with no API quota spent. Turn it on per repository with front matter in `.atlarix.md` on the **default branch** (a pull request can't change it):
+
+```markdown
+---
+review_in_actions: true
+---
+```
+
+It also needs the Atlarix Cloud Agent app on the repository and the workflow above (with `atlarix-review`).
+
+- **What runs here:** a read-only checkout of the pull request's head commit (depth 1, no credentials kept) that answers Atlarix's reads: a file, the path list, a fixed-string `git grep`. Nothing in the pull request is installed or run, and this runner gets no model token and no write token. The review itself (the model, the findings, the comment) runs on Atlarix's side and is billed exactly as before.
+- **Minutes:** the runner waits while the model thinks, so a review uses your Actions minutes for about as long as it takes (typically a few minutes; capped at 15). Free on public repositories; **on private repositories this is billed to your account's Actions minutes.** It ends as soon as the review is posted.
+- **Never lost:** if the runner doesn't start within 3 minutes (Actions disabled, no runner, a workflow without `atlarix-review`), or can't answer a read, the review reads through the GitHub API as usual. A newer push cancels the older review's run.
 
 ## Models
 

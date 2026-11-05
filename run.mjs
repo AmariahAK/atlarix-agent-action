@@ -33,6 +33,7 @@ import {
   relicTitle,
   SUPPORTS,
 } from "./lib.mjs";
+import { isReviewEvent, readEvent, runReview } from "./review.mjs";
 
 const JOB_ID = process.env.ATLARIX_JOB_ID ?? "";
 const API = (process.env.ATLARIX_API_URL ?? "").replace(/\/+$/, "");
@@ -40,6 +41,8 @@ const CLI_VERSION = process.env.ATLARIX_CLI_VERSION || "latest";
 const REPO = process.env.GITHUB_REPOSITORY ?? "";
 const BASE = process.env.GITHUB_REF_NAME ?? "";
 const WORKSPACE = process.env.GITHUB_WORKSPACE ?? process.cwd();
+/** A pull-request review (review.mjs) rather than a cloud task. */
+const IS_REVIEW = isReviewEvent(readEvent());
 
 /** Keep a secret out of the Actions log even if something echoes it. */
 function mask(secret) {
@@ -248,6 +251,9 @@ async function main() {
   if (!/^[0-9a-f-]{36}$/i.test(JOB_ID)) throw new Error("Missing or malformed job id.");
   if (!/^https:\/\//.test(API)) throw new Error("api-url must be https.");
 
+  // A review only serves reads of the checkout; it never runs the agent.
+  if (IS_REVIEW) return runReview({ jobId: JOB_ID, api: API, workspace: WORKSPACE, oidcToken, mask });
+
   const claim = await api("/cloud/claim", { job_id: JOB_ID, supports: SUPPORTS });
   if (!claim.run_token) throw new Error("Atlarix sent no run token for this job.");
   mask(claim.run_token);
@@ -404,6 +410,7 @@ main()
   .then((code) => process.exit(code))
   .catch(async (e) => {
     fail(e.message);
-    if (/^[0-9a-f-]{36}$/i.test(JOB_ID) && API) await report({ status: "failed", error: e.message });
+    // A review has no cloud job to report to: Atlarix finishes it through the API.
+    if (!IS_REVIEW && /^[0-9a-f-]{36}$/i.test(JOB_ID) && API) await report({ status: "failed", error: e.message });
     process.exit(1);
   });
