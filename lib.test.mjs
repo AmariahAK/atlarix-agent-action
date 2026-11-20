@@ -1,7 +1,24 @@
 // node --test   (no dependencies)
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { childEnv, cliArgs, failureReason, outcome, parsePlan, ProgressTracker, relicPayload, relicTitle, stepText, SUPPORTS } from "./lib.mjs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import {
+  childEnv,
+  cliArgs,
+  failureReason,
+  outcome,
+  parsePlan,
+  ProgressTracker,
+  relicNote,
+  relicsMode,
+  relicTitle,
+  settleRelics,
+  stepText,
+  SUPPORTS,
+} from "./lib.mjs";
 
 const base = {
   claim: { tier: "core-auto" },
@@ -86,15 +103,137 @@ test("a failure says why, in words a person can act on", () => {
   assert.match(failureReason({ exitCode: 1, stderrTail: real, started: true }), /Sign in to use Atlarix Core/);
 });
 
-test("relic files: text as text, images as base64; the title from <title>", () => {
-  const p = relicPayload([
-    { path: "index.html", bytes: Buffer.from("<h1>x</h1>") },
-    { path: "img/a.png", bytes: Buffer.from([0x89, 0x50]) },
-  ]);
-  assert.deepEqual(p[0], { path: "index.html", content: "<h1>x</h1>" });
-  assert.equal(p[1].encoding, "base64");
+test("a relic's title comes from <title>, else the folder name", () => {
   assert.equal(relicTitle("<title> Login  report </title>", "slug"), "Login report");
   assert.equal(relicTitle("<h1>no title</h1>", "slug"), "slug");
+});
+
+// ─── relics in the pull request ─────────────────────────────────────────────
+
+function repo() {
+  const ws = mkdtempSync(join(tmpdir(), "relics-ws-"));
+  const git = (args) => {
+    const r = spawnSync("git", args, { cwd: ws, encoding: "utf8" });
+    if (r.status !== 0) throw new Error(r.stderr);
+    return r.stdout.trim();
+  };
+  const put = (p, s) => {
+    mkdirSync(dirname(join(ws, p)), { recursive: true });
+    writeFileSync(join(ws, p), s);
+  };
+  git(["init", "-q", "-b", "main"]);
+  git(["config", "user.email", "t@t.test"]);
+  git(["config", "user.name", "t"]);
+  put("README.md", "hi");
+  git(["add", "-A"]);
+  git(["commit", "-qm", "init"]);
+  const record = (relics) => put(".atlarix/relics.json", JSON.stringify({ relics }));
+  return { ws, git, put, record, has: (p) => existsSync(join(ws, p)) };
+}
+
+test("the relics input: only `exclude` leaves them out", () => {
+  assert.equal(relicsMode(undefined), "include");
+  assert.equal(relicsMode(""), "include");
+  assert.equal(relicsMode(" Exclude "), "exclude");
+  assert.equal(relicsMode("include"), "include");
+});
+
+test("include: a relic the run made stays for the commit; the record file doesn't", () => {
+  const r = repo();
+  r.put("relics/login/index.html", "<title>Login</title>");
+  r.record({ login: { title: "Login flow", kind: "page", created: 1 } });
+  const out = settleRelics({ workspace: r.ws, mode: "include", git: r.git });
+  assert.deepEqual(out.included, [{ dir: "relics/login/", title: "Login flow" }]);
+  assert.deepEqual(out.excluded, []);
+  assert.ok(r.has("relics/login/index.html"));
+  assert.ok(!r.has(".atlarix/relics.json"), "an untracked record stays out of the commit");
+});
+
+test("include: a record file the repository already tracks is kept", () => {
+  const r = repo();
+  r.record({});
+  r.git(["add", "-A"]);
+  r.git(["commit", "-qm", "track the record"]);
+  r.put("relics/a/index.html", "a");
+  r.record({ a: { title: "A" } });
+  settleRelics({ workspace: r.ws, mode: "include", git: r.git });
+  assert.match(readFileSync(join(r.ws, ".atlarix/relics.json"), "utf8"), /"A"/);
+});
+
+test("exclude: the run's relic is removed, and one the PR already had is put back as it was", () => {
+  const r = repo();
+  r.put("relics/old/index.html", "v1");
+  r.git(["add", "-A"]);
+  r.git(["commit", "-qm", "an earlier turn"]);
+  r.put("relics/old/index.html", "v2");
+  r.put("relics/old/extra.png", "x");
+  r.put("relics/new/report.pdf", "%PDF");
+  r.record({ old: { title: "Old" }, new: { title: "New" } });
+  const out = settleRelics({ workspace: r.ws, mode: "exclude", git: r.git });
+  assert.deepEqual(out.excluded.map((x) => x.dir).sort(), ["relics/new/", "relics/old/"]);
+  assert.ok(!r.has("relics/new"));
+  assert.equal(readFileSync(join(r.ws, "relics/old/index.html"), "utf8"), "v1");
+  assert.ok(!r.has("relics/old/extra.png"));
+  assert.equal(r.git(["status", "--porcelain"]), "");
+});
+
+test("a folder in relics/ that Atlarix didn't record is the user's, and is left alone", () => {
+  const r = repo();
+  r.put("relics/mine/notes.md", "mine");
+  r.record({});
+  const out = settleRelics({ workspace: r.ws, mode: "exclude", git: r.git });
+  assert.deepEqual(out, { included: [], excluded: [], skipped: [] });
+  assert.ok(r.has("relics/mine/notes.md"));
+});
+
+test("a file over the size limit is left out and named; a tracked one goes back to the committed version", () => {
+  const r = repo();
+  r.put("relics/v/clip.mp4", "small");
+  r.git(["add", "-A"]);
+  r.git(["commit", "-qm", "clip"]);
+  r.put("relics/v/clip.mp4", "x".repeat(40));
+  r.put("relics/v/big.mov", "x".repeat(40));
+  r.put("relics/v/index.html", "ok");
+  r.record({ v: { title: "Video" } });
+  const out = settleRelics({ workspace: r.ws, mode: "include", git: r.git, maxBytes: 20 });
+  assert.deepEqual(out.skipped.sort(), ["relics/v/big.mov", "relics/v/clip.mp4"]);
+  assert.ok(!r.has("relics/v/big.mov"));
+  assert.equal(readFileSync(join(r.ws, "relics/v/clip.mp4"), "utf8"), "small");
+  assert.ok(r.has("relics/v/index.html"));
+});
+
+test("an older CLI's .atlarix/relics/ folder follows the same rule", () => {
+  const r = repo();
+  r.put(".atlarix/relics/plan/index.html", "<title>The plan</title>");
+  const inc = settleRelics({ workspace: r.ws, mode: "include", git: r.git });
+  assert.deepEqual(inc.included, [{ dir: ".atlarix/relics/plan/", title: "The plan" }]);
+  const exc = settleRelics({ workspace: r.ws, mode: "exclude", git: r.git });
+  assert.equal(exc.excluded.length, 1);
+  assert.ok(!r.has(".atlarix/relics/plan"));
+});
+
+test("a recorded slug that isn't a plain folder name is ignored", () => {
+  const r = repo();
+  r.put("src/a.ts", "x");
+  r.record({ "../src": { title: "x" }, "a/b": { title: "y" } });
+  const out = settleRelics({ workspace: r.ws, mode: "exclude", git: r.git });
+  assert.deepEqual(out.excluded, []);
+  assert.ok(r.has("src/a.ts"));
+});
+
+test("the note says what happened to each relic, and how to opt out", () => {
+  const n = relicNote({
+    included: [{ dir: "relics/login/", title: "Login `flow`" }],
+    excluded: [{ dir: "relics/x/", title: "X" }],
+    skipped: ["relics/login/big.mp4"],
+  });
+  assert.match(n.summary, /relics\/login\//);
+  assert.match(n.summary, /relics\/x\//);
+  assert.match(n.summary, /relics\/login\/big\.mp4/);
+  assert.doesNotMatch(n.summary, /`flow`/);
+  assert.match(n.hint, /relics: exclude/);
+  assert.equal(relicNote({ included: [], excluded: [{ dir: "relics/x/", title: "X" }], skipped: [] }).hint, "");
+  assert.deepEqual(relicNote({ included: [], excluded: [], skipped: [] }), { summary: "", hint: "" });
 });
 
 test("a question runs the CLI read-only; a task doesn't", () => {

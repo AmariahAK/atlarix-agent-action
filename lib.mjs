@@ -6,6 +6,9 @@
 // reads and deletes), not the action's inputs, not the runner's OIDC request
 // credentials.
 
+import { readFileSync, rmSync, statSync } from "node:fs";
+import { join } from "node:path";
+
 /**
  * The CLI's arguments: Atlarix Core with the job's model and token. The token
  * is a FILE path, never a value on the command line.
@@ -215,18 +218,114 @@ export function failureReason({ exitCode, stderrTail, started, timedOut, traject
     : `The agent stopped with an error (exit ${exitCode}).`;
 }
 
-// ─── relics: pages the run made, published instead of committed ─────────────
+// ─── relics: what the run made to share, in the pull request or left out ────
+//
+// The CLI saves a relic as plain files in relics/<slug>/ and records the
+// folders it made in .atlarix/relics.json (older CLIs: .atlarix/relics/<slug>/).
+// By default they go in the pull request; the `relics: exclude` input leaves
+// them out. Only recorded folders are touched, so a relics/ folder of the
+// repository's own is never moved.
 
-const TEXT_EXT = new Set([".html", ".htm", ".css", ".js", ".mjs", ".json", ".svg", ".txt", ".md", ".csv", ".xml"]);
+/** Files over this size are left out of the commit and named in the summary. */
+export const RELIC_MAX_BYTES = 25 * 1024 * 1024;
+const SLUG = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const RECORD = ".atlarix/relics.json";
 
-/** A relic folder's files as the relics function takes them (text, or base64 for binary). */
-export function relicPayload(files) {
-  return files.map(({ path, bytes }) => {
-    const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
-    return TEXT_EXT.has(ext)
-      ? { path, content: Buffer.from(bytes).toString("utf8") }
-      : { path, content: Buffer.from(bytes).toString("base64"), encoding: "base64" };
-  });
+/** The `relics` input: only "exclude" leaves them out. */
+export function relicsMode(value) {
+  return String(value ?? "").trim().toLowerCase() === "exclude" ? "exclude" : "include";
+}
+
+const lines = (s) => String(s ?? "").split("\0").filter(Boolean);
+
+/**
+ * Sort the relics this run made or changed into the commit or out of it.
+ * `git(args)` runs git in `workspace` and returns its stdout.
+ */
+export function settleRelics({ workspace, mode, git, maxBytes = RELIC_MAX_BYTES }) {
+  const atHead = (p) => git(["ls-tree", "-r", "--name-only", "HEAD", "--", p]) !== "";
+  const restore = (p) => {
+    if (atHead(p)) git(["checkout", "HEAD", "--", p]);
+    git(["clean", "-fdq", "--", p]);
+  };
+  const changed = (paths) => [
+    ...new Set([
+      ...lines(git(["ls-files", "-z", "--others", "--exclude-standard", "--", ...paths])),
+      ...lines(git(["diff", "-z", "--name-only", "HEAD", "--", ...paths])),
+    ]),
+  ];
+
+  let recorded = {};
+  try {
+    const r = JSON.parse(readFileSync(join(workspace, RECORD), "utf8"));
+    if (r && typeof r.relics === "object" && r.relics) recorded = r.relics;
+  } catch {
+    /* no record, or not ours to read */
+  }
+
+  const touched = changed(["relics", ".atlarix/relics", RECORD]);
+  const folders = new Map();
+  for (const p of touched) {
+    const m = /^(relics|\.atlarix\/relics)\/([^/]+)\//.exec(p);
+    if (!m || !SLUG.test(m[2])) continue;
+    const old = m[1] !== "relics";
+    if (!old && !Object.hasOwn(recorded, m[2])) continue;
+    const dir = `${m[1]}/${m[2]}/`;
+    if (!folders.has(dir)) folders.set(dir, { dir, slug: m[2], old, files: [] });
+    folders.get(dir).files.push(p);
+  }
+
+  const out = { included: [], excluded: [], skipped: [] };
+  for (const f of folders.values()) {
+    const given = !f.old && typeof recorded[f.slug]?.title === "string" ? recorded[f.slug].title : "";
+    let page = "";
+    try {
+      page = readFileSync(join(workspace, f.dir, "index.html"), "utf8").slice(0, 64 * 1024);
+    } catch {
+      /* not a page */
+    }
+    const title = (given.replace(/\s+/g, " ").trim() || relicTitle(page, f.slug)).slice(0, 120);
+    if (mode === "exclude") {
+      restore(f.dir);
+      out.excluded.push({ dir: f.dir, title });
+      continue;
+    }
+    for (const p of f.files) {
+      let size = 0;
+      try {
+        size = statSync(join(workspace, p)).size;
+      } catch {
+        continue;
+      }
+      if (size <= maxBytes) continue;
+      if (atHead(p)) git(["checkout", "HEAD", "--", p]);
+      else rmSync(join(workspace, p), { force: true });
+      out.skipped.push(p);
+    }
+    out.included.push({ dir: f.dir, title });
+  }
+
+  // The record is Atlarix's bookkeeping: only in the commit if the repository already keeps it.
+  if (touched.includes(RECORD)) {
+    if (!atHead(RECORD)) rmSync(join(workspace, RECORD), { force: true });
+    else if (mode === "exclude") git(["checkout", "HEAD", "--", RECORD]);
+  }
+  return out;
+}
+
+const plain = (s) => String(s).replace(/[`*_[\]<>|\\\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+const where = (r) => `${plain(r.title)} (\`${r.dir}\`)`;
+
+/** Wording pending the owner's approval. The summary note, and the opt-out hint for the pull request. */
+export function relicNote({ included, excluded, skipped }) {
+  const parts = [];
+  if (included.length) parts.push(`Relics in this pull request: ${included.map(where).join(", ")}.`);
+  if (excluded.length) parts.push(`Relics made and left out of this pull request (\`relics: exclude\`): ${excluded.map(where).join(", ")}.`);
+  if (skipped.length) parts.push(`Left out, over 25 MB: ${skipped.map((p) => `\`${p}\``).join(", ")}.`);
+  return {
+    summary: parts.join("\n"),
+    hint: included.length ? "Don't want relics in pull requests? Set `relics: exclude` on the action." : "",
+  };
 }
 
 /** A relic's title: its index.html <title>, else the folder name. */
