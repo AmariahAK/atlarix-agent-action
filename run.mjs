@@ -12,25 +12,26 @@
 //    names, the plan) for the Slack card, at most every few seconds.
 //    A follow-up turn on an open PR starts on that PR's branch; a question
 //    (ask) runs the CLI read-only.
-// 4. After the agent has EXITED: publish the pages it made (.atlarix/relics/)
-//    instead of committing them, fetch a push token (scoped to this one repo),
+// 4. After the agent has EXITED: keep what it made to share (relics/) in the
+//    commit, or leave it out with `relics: exclude`; fetch a push token (scoped to this one repo),
 //    commit, push, open the pull request, and report back — with a reason a
 //    person can act on when it failed.
 //
 // No dependencies: Node 22's fetch, and git/npx from the runner image.
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, relative } from "node:path";
+import { basename, join } from "node:path";
 import {
   childEnv,
   cliArgs,
   failureReason,
   outcome,
   ProgressTracker,
-  relicPayload,
-  relicTitle,
+  relicNote,
+  relicsMode,
+  settleRelics,
   SUPPORTS,
 } from "./lib.mjs";
 import { isReviewEvent, readEvent, runReview } from "./review.mjs";
@@ -185,45 +186,14 @@ function runAgent(args, env, trajectoryFile) {
   });
 }
 
-/**
- * Pages the agent made this run: new folders under .atlarix/relics/. Published
- * for the job's owner when Atlarix can (the Slack card links them), and taken
- * out of the working tree either way, so they never land in the pull request.
- */
-async function publishRelics(claim) {
-  const root = join(WORKSPACE, ".atlarix", "relics");
-  if (!existsSync(root)) return [];
-  // Untracked (or ignored) only: a relic the repository already tracks is the repository's business.
-  const untracked = git(["status", "--porcelain", "--untracked-files=all", "--ignored", "--", ".atlarix/relics"])
-    .split("\n")
-    .filter((l) => l.startsWith("?? ") || l.startsWith("!! "))
-    .map((l) => l.slice(3).split("/")[2])
-    .filter(Boolean);
-  const links = [];
-  for (const slug of [...new Set(untracked)]) {
-    const dir = join(root, slug);
-    if (!existsSync(join(dir, "index.html"))) continue;
-    if (claim.relics) {
-      try {
-        const files = [];
-        const walk = (d) => {
-          for (const name of readdirSync(d, { withFileTypes: true })) {
-            const p = join(d, name.name);
-            if (name.isDirectory()) walk(p);
-            else if (name.isFile()) files.push({ path: relative(dir, p).split("\\").join("/"), bytes: readFileSync(p) });
-          }
-        };
-        walk(dir);
-        const title = relicTitle(readFileSync(join(dir, "index.html"), "utf8"), slug);
-        const { url } = await api("/cloud/relics", { job_id: JOB_ID, title, files: relicPayload(files.slice(0, 50)) });
-        links.push({ title, url });
-      } catch (e) {
-        console.log(`::warning::Page ${slug} was not published: ${e.message}`);
-      }
-    }
-    rmSync(dir, { recursive: true, force: true });
+/** What the agent made to share this run: in the pull request, or left out with `relics: exclude`. */
+function relicsForCommit() {
+  try {
+    return relicNote(settleRelics({ workspace: WORKSPACE, mode: relicsMode(process.env.ATLARIX_RELICS), git }));
+  } catch (e) {
+    console.log(`::warning::Couldn't sort this run's relics: ${e.message}`);
+    return { summary: "", hint: "" };
   }
-  return links;
 }
 
 function run(cmd, args, opts = {}) {
@@ -318,8 +288,9 @@ async function main() {
       trajectoryError: agent.tracker.lastError,
       timedOut: Date.now() - startedAt >= timeoutMs - 5_000,
     });
-  const pages = await publishRelics(claim);
-  const summary = existsSync(outputFile) ? readFileSync(outputFile, "utf8").trim() : "";
+  const relics = relicsForCommit();
+  const said = existsSync(outputFile) ? readFileSync(outputFile, "utf8").trim() : "";
+  const summary = [said, relics.summary].filter(Boolean).join("\n\n");
 
   const dirty = git(["status", "--porcelain"]) !== "";
   const changed = dirty || git(["rev-parse", "HEAD"]) !== startSha;
@@ -390,7 +361,7 @@ async function main() {
       title,
       head: branch,
       base: BASE,
-      body: `${summary || "_The agent left no summary._"}${pages.length ? `\n\n**Pages from this run**\n${pages.map((p) => `- [${p.title.replace(/[\[\]]/g, "")}](${p.url})`).join("\n")}` : ""}\n\n---\n_Opened by the Atlarix cloud agent (job \`${JOB_ID}\`). Nothing is merged until the person who asked approves it._`,
+      body: `${summary || "_The agent left no summary._"}${relics.hint ? `\n\n_${relics.hint}_` : ""}\n\n---\n_Opened by the Atlarix cloud agent (job \`${JOB_ID}\`). Nothing is merged until the person who asked approves it._`,
     }),
   });
   const pr = await res.json().catch(() => ({}));

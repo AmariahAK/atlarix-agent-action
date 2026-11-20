@@ -91,6 +91,7 @@ If your tests need more than the checkout (dependencies, a database), add `.atla
 | `job-id` | — | From the dispatch payload. Required. |
 | `api-url` | `https://cloud.atlarix.dev` | Only for a staging deployment. |
 | `cli-version` | `latest` | The `atlarix` npm version to run. |
+| `relics` | `include` | What Atlarix makes to share (a report, a design, a deck) is saved in `relics/<name>/` and goes in the pull request. `exclude` leaves it out; the summary still says what was made. You can also say "no relics in the PR" in the task. Files over 25 MB are always left out and named in the summary. |
 
 ## FAQ
 
